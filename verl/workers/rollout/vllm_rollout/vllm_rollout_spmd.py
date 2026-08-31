@@ -442,7 +442,7 @@ class vLLMRollout(BaseRollout):
             batch_size=batch_size,
         )
         if self.config.calculate_log_probs:
-            # we will recompute old log prob with actor
+            # Preserve behavior-policy logprobs; the trainer decides whether to reuse or recompute old_log_probs.
             batch["rollout_log_probs"] = rollout_log_probs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
@@ -476,6 +476,9 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        import json
+        import os
+
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -493,7 +496,76 @@ class vLLMRollout(BaseRollout):
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            d0_3_dir = os.environ.get("VAGEN_D0_3_SMOKE_DIR")
+            audit_before = {}
+            select_fragments = (
+                "vision_tower.vision_model.embeddings.patch_embedding.weight",
+                "mm_projector.0.weight",
+                "image_newline",
+                "language_model.model.layers.0",
+                "language_model.lm_head.weight",
+            )
+
+            if d0_3_dir:
+                def audited_weights():
+                    for name, tensor in weights:
+                        if any(fragment in name for fragment in select_fragments):
+                            sample = tensor.detach().flatten()[:1024].float().cpu().clone()
+                            audit_before.setdefault(
+                                name,
+                                {
+                                    "shape": list(tensor.shape),
+                                    "dtype": str(tensor.dtype),
+                                    "mean": float(tensor.detach().float().mean().cpu().item()),
+                                    "first": float(sample[:1].item()),
+                                    "sample": sample,
+                                },
+                            )
+                        yield name, tensor
+
+                model.load_weights(audited_weights())
+                params = dict(model.named_parameters())
+                records = {}
+                for name, rec in audit_before.items():
+                    after = params.get(name)
+                    if after is None:
+                        records[name] = {k: v for k, v in rec.items() if k != "sample"} | {"found_after_sync": False}
+                        continue
+                    after_sample = after.detach().flatten()[: rec["sample"].numel()].float().cpu()
+                    diff = after_sample - rec["sample"]
+                    records[name] = {
+                        "shape": rec["shape"],
+                        "dtype": rec["dtype"],
+                        "before_mean": rec["mean"],
+                        "before_first": rec["first"],
+                        "found_after_sync": True,
+                        "after_mean": float(after.detach().float().mean().cpu().item()),
+                        "after_first": float(after.detach().flatten()[:1].float().cpu().item()),
+                        "sample_count": int(diff.numel()),
+                        "sample_max_abs_error": float(diff.abs().max().item()),
+                        "sample_mean_abs_error": float(diff.abs().mean().item()),
+                    }
+                try:
+                    import torch.distributed as dist
+
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                except Exception:
+                    rank = 0
+                os.makedirs(d0_3_dir, exist_ok=True)
+                with open(os.path.join(d0_3_dir, f"vllm_sync_audit_rank{rank}.json"), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "rank": int(rank),
+                            "base_sync_done": bool(base_sync_done),
+                            "selected_weight_count": len(records),
+                            "records": records,
+                        },
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+            else:
+                model.load_weights(weights)
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -645,10 +717,49 @@ class vLLMAsyncRollout(BaseRollout):
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            import os
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            d0_6_dir = os.environ.get("VAGEN_D0_6_DIR")
+            if d0_6_dir:
+                from verl.workers.sharding_manager.fsdp_vllm import (
+                    _d0_6_compare_weight_sync,
+                    _d0_6_slice_rows,
+                    d0_6_required_source_weight_names,
+                )
+
+                required = d0_6_required_source_weight_names()
+                captured = {}
+                try:
+                    from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+                    tp_rank = get_tensor_model_parallel_rank()
+                    tp_size = get_tensor_model_parallel_world_size()
+                except Exception:
+                    tp_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                    tp_size = int(os.environ.get("VLLM_TENSOR_PARALLEL_SIZE", "1"))
+                large_row_sharded = {"model.embed_tokens.weight", "lm_head.weight"}
+
+                def audited_weights():
+                    for name, tensor in weights:
+                        if name in required:
+                            source = tensor.detach()
+                            if name in large_row_sharded:
+                                source = _d0_6_slice_rows(source, tp_rank, tp_size)
+                            captured[name] = source.cpu().clone()
+                        yield name, tensor
+
+                model.load_weights(audited_weights())
+                _d0_6_compare_weight_sync(
+                    model,
+                    captured,
+                    out_dir=d0_6_dir,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+            else:
+                model.load_weights(weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

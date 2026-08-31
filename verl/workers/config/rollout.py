@@ -117,6 +117,9 @@ class RolloutConfig(BaseConfig):
     skip_tokenizer_init: bool = True
 
     temperature: float = 1.0
+    # Temperature semantics for actor-side logprob recomputation. This is
+    # intentionally separate from rollout sampling temperature.
+    logprob_temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
     do_sample: bool = True

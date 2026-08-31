@@ -68,6 +68,7 @@ tracking metrics to diagnose and correct off-policy issues.
 from typing import Any, Optional
 
 import torch
+from omegaconf import open_dict
 
 import verl.utils.torch_functional as verl_F
 from verl.protocol import DataProto
@@ -936,8 +937,12 @@ def apply_rollout_correction(
     # Use rollout log probs as old log probs (zero-cost substitution)
     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
 
-    # Always pass rollout_correction config to actor for metrics computation
-    policy_loss_config["rollout_correction"] = rollout_corr_config
+    # Always pass rollout_correction config to actor for metrics computation.
+    # PolicyLossConfig is structured in normal Hydra runs, while this
+    # diagnostic field is intentionally optional.
+    if policy_loss_config is not None:
+        with open_dict(policy_loss_config):
+            policy_loss_config["rollout_correction"] = rollout_corr_config
 
     # Check if policy gradient loss mode is enabled
     use_policy_gradient = rollout_corr_config.get("use_policy_gradient", False)

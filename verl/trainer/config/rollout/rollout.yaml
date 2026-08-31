@@ -10,6 +10,11 @@ mode: sync
 # Sampling temperature for rollout.
 temperature: 1.0
 
+# Actor-side logprob recompute temperature. vLLM V1 returns sampled-token
+# logprobs under raw logits by default, so this is intentionally separate
+# from sampling temperature.
+logprob_temperature: 1.0
+
 # Top-k sampling parameter. -1 for vLLM rollout, 0 for HF rollout.
 top_k: -1
 
@@ -313,4 +318,3 @@ prometheus:
 
   # Specify served_model_name to avoid displaying overly long model paths in Grafana
   served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
-

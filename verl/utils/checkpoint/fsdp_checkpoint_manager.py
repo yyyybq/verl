@@ -40,6 +40,75 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+
+def _sanitize_config_dict_for_json(obj):
+    """Make nested config dicts JSON-serializable with sort_keys=True.
+
+    HF ``save_pretrained`` uses ``json.dumps(..., sort_keys=True)``. Nested dicts
+    with ``None`` keys (seen on critic id2label/pruned_heads mutations) raise:
+    TypeError: '<' not supported between instances of 'NoneType' and 'str'.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k is None:
+                key = "null"
+            elif isinstance(k, (str, int, float, bool)):
+                key = str(k) if not isinstance(k, str) else k
+            else:
+                key = str(k)
+            out[key] = _sanitize_config_dict_for_json(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_config_dict_for_json(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # torch.dtype / pathlib / custom objects
+    return str(obj)
+
+
+def _safe_save_model_config(model_config, hf_config_tokenizer_path: str) -> None:
+    """Save HF config; fall back to sanitized JSON if save_pretrained fails."""
+    try:
+        model_config.save_pretrained(hf_config_tokenizer_path)
+        return
+    except TypeError as e:
+        log_with_rank(
+            f"model_config.save_pretrained failed ({e}); writing sanitized config.json fallback",
+            rank=0,
+            logger=logger,
+            log_only_rank_0=True,
+        )
+    except Exception as e:
+        log_with_rank(
+            f"model_config.save_pretrained failed ({type(e).__name__}: {e}); writing sanitized config.json fallback",
+            rank=0,
+            logger=logger,
+            log_only_rank_0=True,
+        )
+
+    # Prefer full to_dict; sanitize keys/values for sort_keys dumps.
+    try:
+        config_dict = model_config.to_dict()
+    except Exception:
+        config_dict = dict(getattr(model_config, "__dict__", {}))
+    config_dict = _sanitize_config_dict_for_json(config_dict)
+    # Drop obviously non-config private runtime fields if present
+    for drop in ("_auto_class", "_commit_hash"):
+        config_dict.pop(drop, None)
+    out_file = os.path.join(hf_config_tokenizer_path, "config.json")
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2, sort_keys=True)
+        f.write("\n")
+    # Best-effort: still copy custom modeling files when auto_map exists
+    try:
+        if hasattr(model_config, "auto_map"):
+            # custom_object_save needs the unwrapped model; caller handles that separately.
+            pass
+    except Exception:
+        pass
+
+
 @dataclass
 class FSDPConfig:
     """Configuration for FSDP checkpointing.
@@ -276,7 +345,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     # if the generation config isn't available, we don't save it
                     pass
 
-            model_config.save_pretrained(hf_config_tokenizer_path)
+            _safe_save_model_config(model_config, hf_config_tokenizer_path)
             if self.processing_class is not None:
                 self.processing_class.save_pretrained(hf_config_tokenizer_path)
             log_with_rank(
@@ -316,7 +385,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     from transformers import AutoModelForTokenClassification
 
                     auto_model_cls = AutoModelForTokenClassification
-                elif "ForCausalLM" in model_config.architectures[0]:
+                elif (
+                    "ForCausalLM" in model_config.architectures[0]
+                    or "NEOChatModel" in model_config.architectures[0]
+                ):
                     from transformers import AutoModelForCausalLM
 
                     auto_model_cls = AutoModelForCausalLM
@@ -336,7 +408,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                         auto_model_cls = AutoModelForVision2Seq
                 else:
-                    raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
+                    raise NotImplementedError(f"Unknown architecture {getattr(model_config, 'architectures', None)}")
 
                 with init_empty_weights():
                     save_model = auto_model_cls.from_config(model_config, torch_dtype=torch.bfloat16)

@@ -41,13 +41,27 @@ from verl.utils.ulysses import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+flash_attn_func = None
+flash_attn_varlen_func = None
+_flash_supports_window_size = False
+_flash_supports_deterministic = False
+_flash_use_top_left_mask = False
 
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
 
-    _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
-    _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
-    _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+if os.getenv("TRANSFORMERS_ATTN_IMPLEMENTATION", "").lower() != "eager" and is_flash_attn_2_available():
+    try:
+        from flash_attn import flash_attn_func, flash_attn_varlen_func
+
+        _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
+        _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
+        _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+    except (ImportError, OSError) as _e:
+        logger.warning(f"flash_attn import failed ({_e}), falling back to eager attention.")
+        flash_attn_func = None
+        flash_attn_varlen_func = None
+        _flash_supports_window_size = False
+        _flash_supports_deterministic = False
+        _flash_use_top_left_mask = False
 
 if is_npu_available:
     from transformers.integrations.npu_flash_attention import npu_flash_attn_func as flash_attn_func
@@ -230,33 +244,57 @@ def _custom_flash_attention_forward(
         q, k, v, (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k) = prepare_fa2_from_position_ids(
             query_states, key_states, value_states, position_ids
         )
-        attn_output = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            dropout_p=kwargs.pop("dropout", 0.0),
-            softmax_scale=kwargs.pop("softmax_scale", None),
-            causal=is_causal,
-            **flash_kwargs,
-        )
+        if flash_attn_varlen_func is not None:
+            attn_output = flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=kwargs.pop("dropout", 0.0),
+                softmax_scale=kwargs.pop("softmax_scale", None),
+                causal=is_causal,
+                **flash_kwargs,
+            )
+        else:
+            # Fallback to SDPA when flash_attn is unavailable (e.g. GLIBC too old)
+            q = q.transpose(0, 1).unsqueeze(0)  # (1, heads, total_seq, head_dim)
+            k = k.transpose(0, 1).unsqueeze(0)
+            v = v.transpose(0, 1).unsqueeze(0)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=is_causal
+            ).squeeze(0).transpose(0, 1)
         attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
     else:
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            query_length,
-            is_causal=is_causal,
-            sliding_window=sliding_window,
-            use_top_left_mask=use_top_left_mask,
-            deterministic=deterministic,
-            **kwargs,
-        )  # do not pass position_ids to old flash_attention_forward
+        if flash_attn_func is None:
+            # flash-attn is installed in this env but cannot be loaded on these
+            # nodes (GLIBC too old). Use PyTorch SDPA with the same tensor layout.
+            q = query_states.transpose(1, 2)
+            k = key_states.transpose(1, 2)
+            v = value_states.transpose(1, 2)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                dropout_p=kwargs.pop("dropout", 0.0),
+                is_causal=is_causal and attention_mask is None,
+            ).transpose(1, 2)
+        else:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
+                is_causal=is_causal,
+                sliding_window=sliding_window,
+                use_top_left_mask=use_top_left_mask,
+                deterministic=deterministic,
+                **kwargs,
+            )  # do not pass position_ids to old flash_attention_forward
 
     if sp_size > 1:
         # (batch_size, seq_length, num_head, head_size)

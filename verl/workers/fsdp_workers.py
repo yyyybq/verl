@@ -19,9 +19,31 @@ import datetime
 import json
 import logging
 import os
+import time
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
+
+
+def _resolve_attn_implementation(requested: str) -> str:
+    """Return eager when flash-attn is unavailable or explicitly disabled."""
+    requested = os.getenv("TRANSFORMERS_ATTN_IMPLEMENTATION", requested)
+    if requested != "flash_attention_2":
+        return requested
+    try:
+        import importlib.metadata
+        importlib.metadata.version("flash_attn")
+        import flash_attn_2_cuda  # noqa: F401
+        import flash_attn  # noqa: F401
+        return requested
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            "flash_attn unavailable (GLIBC mismatch or missing). "
+            "Falling back to attn_implementation='eager'. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        )
+        return "eager"
+
 
 import numpy as np
 import psutil
@@ -94,6 +116,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _d0_13_marker(stage: str, **extra) -> None:
+    out_dir = os.environ.get("VAGEN_D0_13_TIMELINE_DIR")
+    if not out_dir:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = -1
+    rec = {
+        "stage": stage,
+        "rank": int(rank),
+        "pid": int(os.getpid()),
+        "time": time.time(),
+        **extra,
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"fsdp_worker_rank{rank}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -315,7 +358,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = _resolve_attn_implementation(
+            override_model_config.get("attn_implementation", "flash_attention_2")
+        )
         actor_model_config = AutoConfig.from_pretrained(
             local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
@@ -338,6 +383,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
+            try:
+                setattr(actor_model_config, attr, attn_implementation)
+            except Exception:
+                pass
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
@@ -750,6 +800,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         get_torch_device().set_rng_state(self.torch_random_states)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def d0_3_sync_actor_to_rollout(self):
+        """Diagnostic-only resync hook for D0.3 plumbing smoke."""
+        assert self._is_actor, "D0.3 sync requires an actor worker"
+        assert self._is_rollout, "D0.3 sync requires a colocated rollout worker"
+        await self.rollout_mode()
+        await self.trainer_mode()
+        return DataProto(meta_info={"d0_3_post_update_resync": True})
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
@@ -864,19 +923,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        _d0_13_marker("fsdp_update_actor_enter")
         if self._is_offload_param:
+            _d0_13_marker("before_load_fsdp_model")
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            _d0_13_marker("after_load_fsdp_model")
         if self._is_offload_optimizer:
+            _d0_13_marker("before_load_fsdp_optimizer")
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            _d0_13_marker("after_load_fsdp_optimizer")
 
+        _d0_13_marker("before_sharding_manager")
         with self.ulysses_sharding_manager:
+            _d0_13_marker("inside_sharding_manager_before_data_cpu")
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            _d0_13_marker("inside_sharding_manager_after_data_cpu")
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                _d0_13_marker("before_update_policy")
                 metrics = self.actor.update_policy(data=data)
+                _d0_13_marker("after_update_policy", metric_keys=len(metrics))
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
+            _d0_13_marker("before_flops_metrics", global_token_num_len=len(global_num_tokens))
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics["perf/mfu/actor"] = (
                 estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
@@ -887,20 +957,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            _d0_13_marker("before_lr_scheduler_step")
             self.actor_lr_scheduler.step()
+            _d0_13_marker("after_lr_scheduler_step")
 
             # TODO: here, we should return all metrics
+            _d0_13_marker("before_dataproto_output", metric_keys=len(metrics))
             output = DataProto(meta_info={"metrics": metrics})
 
+            _d0_13_marker("before_output_to_cpu")
             output = output.to("cpu")
+            _d0_13_marker("after_output_to_cpu")
 
+        _d0_13_marker("after_sharding_manager")
         if self._is_offload_param:
+            _d0_13_marker("before_offload_fsdp_model")
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+            _d0_13_marker("after_offload_fsdp_model")
         if self._is_offload_optimizer:
+            _d0_13_marker("before_offload_fsdp_optimizer")
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            _d0_13_marker("after_offload_fsdp_optimizer")
 
+        _d0_13_marker("worker_returned", metric_keys=len(output.meta_info.get("metrics", {})))
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -971,15 +1052,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        sampling_temperature = float(self.config.rollout.temperature)
+        logprob_temperature = float(self.config.rollout.get("logprob_temperature", 1.0))
+        data.meta_info["temperature"] = logprob_temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                legacy_output = None
+                if os.environ.get("VAGEN_D0_4_DIR") and abs(sampling_temperature - logprob_temperature) > 1e-8:
+                    data.meta_info["temperature"] = sampling_temperature
+                    legacy_output, _ = self.actor.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(
                 tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
+                meta_info={
+                    "temperature": logprob_temperature,
+                    "sampling_temperature": sampling_temperature,
+                },
             )
+            if legacy_output is not None:
+                output.batch["old_log_probs_sampling_temperature"] = legacy_output
 
         output = output.to("cpu")
 
@@ -1252,7 +1344,9 @@ class CriticWorker(Worker, DistProfilerExtension):
         from transformers import AutoConfig
 
         # override model kwargs
-        attn_implementation = override_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = _resolve_attn_implementation(
+            override_config.get("attn_implementation", "flash_attention_2")
+        )
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
             attn_implementation=attn_implementation,
@@ -1371,6 +1465,30 @@ class CriticWorker(Worker, DistProfilerExtension):
             else:
                 if self.rank == 0:
                     print("[critic model] No vision tower found.")
+
+        if self.rank == 0:
+            trainable_counts = {"value_head": 0, "vision": 0, "backbone": 0}
+            for name, param in critic_module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                lname = name.lower()
+                n_param = param.numel()
+                if any(key in lname for key in ("score", "value_head", "v_head")):
+                    trainable_counts["value_head"] += n_param
+                elif any(key in lname for key in ("vision", "clip", "siglip", "mm_projector")):
+                    trainable_counts["vision"] += n_param
+                else:
+                    trainable_counts["backbone"] += n_param
+            total_trainable = sum(trainable_counts.values())
+            value_head_params = trainable_counts["value_head"]
+            vision_params = trainable_counts["vision"]
+            backbone_params = trainable_counts["backbone"]
+            print(
+                f"[critic model] trainable params total={total_trainable:,} "
+                f"value_head={value_head_params:,} "
+                f"vision={vision_params:,} "
+                f"backbone={backbone_params:,}"
+            )
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
@@ -1669,7 +1787,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=_resolve_attn_implementation("flash_attention_2"),
                 trust_remote_code=trust_remote_code,
             )
 

@@ -18,7 +18,9 @@ Single Process Actor
 """
 
 import logging
+import json
 import os
+import time
 
 import torch
 from torch import nn
@@ -30,7 +32,13 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.fsdp_utils import (
+    FSDPModule,
+    align_optimizer_grad_dtype_device_,
+    fsdp1_clip_grad_norm_,
+    fsdp2_clip_grad_norm_,
+    repair_unreduced_fsdp1_grad_shards_,
+)
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -44,6 +52,66 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _d0_3_group_name(name: str) -> str:
+    if "flat_param" in name or "_flat_param" in name:
+        return "fsdp_flat_mixed"
+    if "vision_tower" in name:
+        return "vision_tower"
+    if "mm_projector" in name:
+        return "mm_projector"
+    if "nfp_head" in name:
+        return "nfp_head"
+    if "image_newline" in name:
+        return "miv_related"
+    if name.startswith("lm_head") or ".lm_head" in name:
+        return "lm_head"
+    marker = "model.layers."
+    if marker in name:
+        try:
+            idx = int(name.split(marker, 1)[1].split(".", 1)[0])
+        except Exception:
+            return "llm_other"
+        if idx < 9:
+            return "llm_early"
+        if idx < 19:
+            return "llm_middle"
+        return "llm_late"
+    if "embed_tokens" in name or "model.norm" in name:
+        return "llm_other"
+    return "other"
+
+
+def _d0_3_empty_group() -> dict:
+    return {
+        "requires_grad_params": 0,
+        "optimizer_member_params": 0,
+        "params_with_grad": 0,
+        "grad_norm_sq": 0.0,
+        "update_norm_sq": 0.0,
+    }
+
+
+def _d0_13_marker(stage: str, **extra) -> None:
+    out_dir = os.environ.get("VAGEN_D0_13_TIMELINE_DIR")
+    if not out_dir:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:
+        rank = -1
+    rec = {
+        "stage": stage,
+        "rank": int(rank),
+        "pid": int(os.getpid()),
+        "time": time.time(),
+        **extra,
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"actor_rank{rank}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -91,13 +159,32 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+    @staticmethod
+    def _extract_auxiliary_loss(output) -> torch.Tensor | None:
+        """Return a scalar auxiliary loss from model outputs, if one is present."""
+        aux_loss = getattr(output, "loss", None)
+        if aux_loss is None and isinstance(output, (tuple, list)) and len(output) > 0:
+            first = output[0]
+            if torch.is_tensor(first) and first.dim() == 0:
+                aux_loss = first
+        if aux_loss is None:
+            return None
+        if isinstance(aux_loss, (tuple, list)):
+            aux_loss = aux_loss[0] if aux_loss else None
+        if aux_loss is None:
+            return None
+        if not torch.is_tensor(aux_loss):
+            aux_loss = torch.as_tensor(aux_loss)
+        return aux_loss.mean()
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, return_aux_loss=False
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            aux_loss: optional scalar auxiliary model loss
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -278,14 +365,34 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            if return_aux_loss:
+                return entropy, log_probs, self._extract_auxiliary_loss(output)
             return entropy, log_probs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
             self.scaler.unscale_(self.actor_optimizer)
+        _d0_13_marker("before_grad_clip")
         if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            fsdp_grad_repair = repair_unreduced_fsdp1_grad_shards_(self.actor_module)
+            if fsdp_grad_repair["repaired"]:
+                _d0_13_marker("fsdp_unreduced_grad_repair", **fsdp_grad_repair)
+                if torch.distributed.get_rank() == 0:
+                    logger.warning(
+                        "Reduce-scattered %s/%s unexpectedly unsharded FSDP gradients; examples=%s",
+                        fsdp_grad_repair["repaired"],
+                        fsdp_grad_repair["scanned"],
+                        fsdp_grad_repair["examples"],
+                    )
+            grad_dtypes = sorted(
+                {str(param.grad.dtype) for param in self.actor_module.parameters() if param.grad is not None}
+            )
+            if len(grad_dtypes) > 1:
+                _d0_13_marker("mixed_dtype_grad_clip", grad_dtypes=grad_dtypes)
+                if torch.distributed.get_rank() == 0:
+                    logger.warning("Using mixed-dtype FSDP grad clipping for gradients: %s", grad_dtypes)
+            grad_norm = fsdp1_clip_grad_norm_(self.actor_module, max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
             grad_norm = fsdp2_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         else:
@@ -293,8 +400,46 @@ class DataParallelPPOActor(BasePPOActor):
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
+        _d0_13_marker(
+            "after_grad_clip",
+            grad_norm=float(grad_norm.detach().float().cpu().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
+        )
+
+        optimizer_grad_alignment = align_optimizer_grad_dtype_device_(self.actor_optimizer)
+        if optimizer_grad_alignment["aligned"]:
+            _d0_13_marker("optimizer_grad_alignment", **optimizer_grad_alignment)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.warning(
+                    "Aligned %s/%s optimizer gradients to parameter dtype/device; examples=%s",
+                    optimizer_grad_alignment["aligned"],
+                    optimizer_grad_alignment["scanned"],
+                    optimizer_grad_alignment["examples"],
+                )
+
+        d0_3_dir = os.environ.get("VAGEN_D0_3_SMOKE_DIR")
+        d0_3_before = None
+        d0_3_stats = None
+        if d0_3_dir and self.actor_optimizer is not None:
+            opt_ids = {id(p) for group in self.actor_optimizer.param_groups for p in group.get("params", [])}
+            d0_3_before = {}
+            d0_3_stats = {}
+            for name, p in self.actor_module.named_parameters():
+                group_name = _d0_3_group_name(name)
+                rec = d0_3_stats.setdefault(group_name, _d0_3_empty_group())
+                n = int(p.numel())
+                if p.requires_grad:
+                    rec["requires_grad_params"] += n
+                if id(p) in opt_ids:
+                    rec["optimizer_member_params"] += n
+                if p.grad is not None:
+                    rec["params_with_grad"] += n
+                    g = p.grad.detach().float()
+                    rec["grad_norm_sq"] += float(torch.sum(g * g).detach().cpu().item())
+                if p.requires_grad and id(p) in opt_ids:
+                    d0_3_before[name] = p.detach().float().cpu().clone()
 
         # if grad_norm is not finite, skip the update
+        _d0_13_marker("before_optimizer_step")
         if self.scaler is not None:
             self.scaler.step(self.actor_optimizer)
             self.scaler.update()
@@ -304,6 +449,39 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
             else:
                 self.actor_optimizer.step()
+        _d0_13_marker("after_optimizer_step")
+        if d0_3_dir and d0_3_before is not None and d0_3_stats is not None:
+            for name, p in self.actor_module.named_parameters():
+                before = d0_3_before.get(name)
+                if before is None:
+                    continue
+                group_name = _d0_3_group_name(name)
+                diff = p.detach().float().cpu() - before
+                d0_3_stats[group_name]["update_norm_sq"] += float(torch.sum(diff * diff).item())
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            out_stats = {}
+            for group_name, rec in d0_3_stats.items():
+                out_stats[group_name] = {
+                    "requires_grad_params": rec["requires_grad_params"],
+                    "optimizer_member_params": rec["optimizer_member_params"],
+                    "params_with_grad": rec["params_with_grad"],
+                    "grad_norm": rec["grad_norm_sq"] ** 0.5,
+                    "update_norm": rec["update_norm_sq"] ** 0.5,
+                }
+            os.makedirs(d0_3_dir, exist_ok=True)
+            with open(os.path.join(d0_3_dir, f"optimizer_audit_rank{rank}.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "rank": int(rank),
+                        "grad_clip_norm": float(grad_norm.detach().float().cpu().item()),
+                        "note": "FSDP use_orig_params=false may expose flat/sharded parameters as fsdp_flat_mixed.",
+                        "groups": out_stats,
+                    },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+            _d0_13_marker("after_optimizer_audit_write")
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -406,6 +584,11 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
+        _d0_13_marker(
+            "update_policy_start",
+            minibatches=len(mini_batches),
+            ppo_epochs=int(self.config.ppo_epochs),
+        )
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -439,8 +622,11 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    entropy, log_prob, aux_loss = self._forward_micro_batch(
+                        model_inputs,
+                        temperature=temperature,
+                        calculate_entropy=calculate_entropy,
+                        return_aux_loss=True,
                     )
 
                     # for fully_async_policy recipe
@@ -497,6 +683,26 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
+                    if aux_loss is not None:
+                        # Prefer image_gen_loss_coef (U1 FM) when set; else nfp_loss_coef (Cambrian).
+                        image_gen_coef = self.config.get("image_gen_loss_coef", None)
+                        nfp_loss_coef = (
+                            float(image_gen_coef)
+                            if image_gen_coef is not None
+                            else self.config.get("nfp_loss_coef", 1.0)
+                        )
+                        aux_loss = aux_loss.to(policy_loss.device)
+                        policy_loss = policy_loss + aux_loss * nfp_loss_coef
+                        micro_batch_metrics["actor/nfp_loss"] = aux_loss.detach().item()
+                        micro_batch_metrics["actor/nfp_loss_scaled"] = (
+                            aux_loss.detach().item() * nfp_loss_coef * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/nfp_loss_coef"] = nfp_loss_coef
+                        micro_batch_metrics["actor/image_gen_loss_coef"] = nfp_loss_coef
+                        micro_batch_metrics["actor/nfp_loss_active"] = 1.0
+                    else:
+                        micro_batch_metrics["actor/nfp_loss_active"] = 0.0
+
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         # compute kl loss
@@ -515,15 +721,71 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
                     if self.scaler is not None:
+                        _d0_13_marker("before_backward", batch_idx=int(batch_idx))
                         self.scaler.scale(loss).backward()
                     else:
+                        _d0_13_marker("before_backward", batch_idx=int(batch_idx))
                         loss.backward()
+                    _d0_13_marker("after_backward", batch_idx=int(batch_idx))
+
+                    # U1 Plan B two-pass FM: PG backward above frees und activations;
+                    # then gen-only FM backward (stashed during forward when U1_FM_BACKPROP=1).
+                    def _unwrap_actor_module(m):
+                        cur = m
+                        for _ in range(6):
+                            if hasattr(cur, "compute_pending_fm_aux_loss"):
+                                return cur
+                            if hasattr(cur, "module"):
+                                cur = cur.module
+                                continue
+                            break
+                        return m
+
+                    u1_mod = _unwrap_actor_module(self.actor_module)
+                    if isinstance(self.actor_module, FSDP) and hasattr(u1_mod, "compute_pending_fm_aux_loss"):
+                        # Keep the pending-only FM pass inside the root FSDP
+                        # forward lifecycle. Directly calling the unwrapped
+                        # method after the PG forward/backward accesses
+                        # resharded (zero-storage) root parameters.
+                        fm_loss = self.actor_module(_u1_compute_pending_only=True)
+                    elif hasattr(u1_mod, "compute_pending_fm_aux_loss"):
+                        fm_loss = u1_mod.compute_pending_fm_aux_loss()
+                    else:
+                        fm_loss = None
+                    if fm_loss is not None:
+                        image_gen_coef = self.config.get("image_gen_loss_coef", None)
+                        nfp_loss_coef = (
+                            float(image_gen_coef)
+                            if image_gen_coef is not None
+                            else float(self.config.get("nfp_loss_coef", 1.0))
+                        )
+                        fm_scaled = fm_loss.to(loss.device) * nfp_loss_coef * loss_scale_factor
+                        if self.scaler is not None:
+                            self.scaler.scale(fm_scaled).backward()
+                        else:
+                            fm_scaled.backward()
+                        micro_batch_metrics["actor/nfp_loss"] = float(fm_loss.detach().item())
+                        micro_batch_metrics["actor/nfp_loss_scaled"] = float(
+                            fm_loss.detach().item() * nfp_loss_coef * loss_scale_factor
+                        )
+                        micro_batch_metrics["actor/nfp_loss_coef"] = nfp_loss_coef
+                        micro_batch_metrics["actor/image_gen_loss_coef"] = nfp_loss_coef
+                        micro_batch_metrics["actor/nfp_loss_active"] = 1.0
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
+                    # Explicit aliases for gated diagnostics / smoke dashboards
+                    micro_batch_metrics["actor/pg_loss_raw"] = float(pg_loss.detach().item())
+                    micro_batch_metrics["actor/pg_loss_weighted"] = float(pg_loss.detach().item() * loss_scale_factor)
+                    micro_batch_metrics["actor/total_loss"] = float(loss.detach().item())
+                    if entropy_coeff != 0:
+                        micro_batch_metrics["actor/entropy_loss"] = float(entropy_loss.detach().item())
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
+                _d0_13_marker("before_metrics_reduce", batch_idx=int(batch_idx))
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                _d0_13_marker("after_metrics_reduce", metric_keys=len(metrics))
         self.actor_optimizer.zero_grad()
+        _d0_13_marker("before_worker_return", metric_keys=len(metrics))
         return metrics

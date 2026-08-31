@@ -72,6 +72,8 @@ class ActorConfig(BaseConfig):
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
+        nfp_loss_coef (float): Coefficient for optional next-frame prediction auxiliary loss.
+        image_gen_loss_coef (float|None): Optional SenseNova-U1 FM image-gen aux coef; overrides nfp_loss_coef when set.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -106,6 +108,8 @@ class ActorConfig(BaseConfig):
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     entropy_coeff: float = 0
+    nfp_loss_coef: float = 1.0
+    image_gen_loss_coef: Optional[float] = None
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001

@@ -82,15 +82,28 @@ def need_reward_model(
     return Role.RewardModel in role_worker_mapping
 
 
+CRITIC_ADV_ESTIMATORS = {
+    AdvantageEstimator.GAE.value,
+    "no_concat_gae",
+    "no_concat_gae_first",
+    "no_concat_gae_last",
+    "masked_gae",
+}
+
+
 def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
     if config.critic.enable is not None:
         return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+
+    adv_estimator = config.algorithm.adv_estimator
+    adv_estimator_name = getattr(adv_estimator, "value", adv_estimator)
+    if str(adv_estimator_name) in CRITIC_ADV_ESTIMATORS:
         return True
-    else:
-        warnings.warn(
-            "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",
-            stacklevel=2,
-        )
-        return False
+
+    warnings.warn(
+        f"Disabled critic as algorithm.adv_estimator={adv_estimator_name!r} does not require a value function. "
+        "If it is not intended, please set critic.enable=True",
+        stacklevel=2,
+    )
+    return False

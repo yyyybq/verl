@@ -187,14 +187,42 @@ class BaseModelMerger(ABC):
         self.model_config = AutoConfig.from_pretrained(
             self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code
         )
+        # SenseNova-U1's NEOVisionConfig stores these values as one-element
+        # tuples (via trailing commas in its constructor).  JSON turns the
+        # tuple into a list, and loading that JSON wraps it once more, which
+        # otherwise produces values such as ``[[0.5]]`` and breaks model
+        # construction.  Undo only that extra serialization layer here.
+        if getattr(self.model_config, "model_type", None) == "neo_chat":
+            vision_config = getattr(self.model_config, "vision_config", None)
+            for name in ("downsample_ratio", "llm_hidden_size"):
+                value = getattr(vision_config, name, None)
+                if isinstance(value, tuple) and len(value) == 1 and isinstance(value[0], (list, tuple)):
+                    setattr(vision_config, name, tuple(value[0]))
 
     def get_transformers_auto_model_class(self):
         has_remote_code = hasattr(self.model_config, "auto_map") and any(
             self.model_config.architectures[0] in val for val in self.model_config.auto_map.values()
         )
         if has_remote_code:
-            auto_class = next(
+            # A custom config may register the same architecture for both the
+            # generic ``AutoModel`` and a task-specific auto class.  Dict
+            # insertion order is not a sound way to choose between them: U1,
+            # for example, lists AutoModel first but is trained and saved as a
+            # causal LM.  Prefer supported task-specific mappings explicitly.
+            matching_auto_classes = {
                 k for k, v in self.model_config.auto_map.items() if self.model_config.architectures[0] in v
+            }
+            auto_class = next(
+                (
+                    candidate
+                    for candidate in (
+                        "AutoModelForCausalLM",
+                        "AutoModelForTokenClassification",
+                        "AutoModelForVision2Seq",
+                    )
+                    if candidate in matching_auto_classes
+                ),
+                next(iter(matching_auto_classes)),
             )
             match auto_class:
                 case "AutoModelForCausalLM":

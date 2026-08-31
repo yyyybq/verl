@@ -16,6 +16,7 @@ Utilities to create common models from huggingface
 """
 
 import json
+import logging
 import os
 import re
 import warnings
@@ -33,7 +34,6 @@ from transformers import (
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
     GenerationConfig,
-    MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
@@ -41,6 +41,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
 from verl.utils.import_utils import is_trl_available
+
+logger = logging.getLogger(__name__)
 
 
 class LambdaLayer(nn.Module):
@@ -426,6 +428,7 @@ def _load_hf_model(config, model_config, is_value_model):
         warnings.simplefilter("ignore")
         # TODO: to find a better way to load mistral7b-rm lm_head
         if "mistral7b-rm" in config.model.path:
+            from transformers.models.mistral.modeling_mistral import MistralForSequenceClassification
             model = MistralForSequenceClassification.from_pretrained(
                 local_model_path,
                 torch_dtype="auto",
@@ -619,34 +622,52 @@ def patch_valuehead_model(model) -> None:
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
 
+    attn_implementation = os.getenv("TRANSFORMERS_ATTN_IMPLEMENTATION", "eager")
+    # Keep config internals consistent with the requested implementation. Some
+    # model constructors consult config before considering from_pretrained kwargs.
+    for attr in ("_attn_implementation", "_attn_implementation_internal", "attn_implementation"):
+        try:
+            setattr(model_config, attr, attn_implementation)
+        except Exception:
+            pass
+
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
             torch_dtype=torch_dtype,
             config=model_config,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             trust_remote_code=trust_remote_code,
         )
         return model
     except BaseException as e:
+        logger.exception("AutoModelForTokenClassification failed while loading value model from %s", local_path)
         if not is_trl_available():
             raise RuntimeError(
-                f"model({local_path}) is not a value head model, please install trl to make it valid"
+                f"model({local_path}) could not be loaded as a token-classification/value-head model "
+                f"and trl is unavailable. Original error: {type(e).__name__}: {e}"
             ) from e
 
     assert is_trl_available()
 
     from trl import AutoModelForCausalLMWithValueHead
 
-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-        module_class = AutoModelForVision2Seq
-    else:
-        module_class = AutoModelForCausalLM
+    config_type = str(getattr(model_config, "model_type", "")).lower()
+    architectures = [str(a) for a in getattr(model_config, "architectures", []) or []]
+    is_vlm_config = (
+        type(model_config) in AutoModelForVision2Seq._model_mapping.keys()
+        or hasattr(model_config, "vision_config")
+        or hasattr(model_config, "visual_config")
+        or hasattr(model_config, "text_config")
+        or "vl" in config_type
+        or any("Vision" in arch or "VL" in arch for arch in architectures)
+    )
+    module_class = AutoModelForVision2Seq if is_vlm_config else AutoModelForCausalLM
     ori_model = module_class.from_pretrained(
         pretrained_model_name_or_path=local_path,
         torch_dtype=torch_dtype,
         config=model_config,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
         trust_remote_code=trust_remote_code,
     )
     # VLM configs (e.g. Qwen3-VL) store hidden_size in text_config, not at

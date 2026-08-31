@@ -201,7 +201,8 @@ class vLLMHttpServerBase:
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
-            engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
+            # vLLM CLI expects JSON string for --limit-mm-per-prompt
+            engine_kwargs["limit_mm_per_prompt"] = json.dumps({"image": int(self.config.get("limit_images"))})
         if self.config.cudagraph_capture_sizes:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
@@ -379,13 +380,22 @@ class vLLMHttpServerBase:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        # Keep prompt within max_model_len so max_tokens stays valid for vLLM.
+        if len(prompt_ids) >= self.config.max_model_len:
+            prompt_ids = prompt_ids[-(self.config.max_model_len - 1) :]
         max_model_new_tokens = self.config.max_model_len - len(prompt_ids)
+        original_sampling_params = dict(sampling_params)
         if "max_new_tokens" in sampling_params and sampling_params["max_new_tokens"] is not None:
             max_tokens = min(sampling_params.pop("max_new_tokens"), self.config.response_length, max_model_new_tokens)
         else:
             sampling_params.pop("max_new_tokens", None)
             max_tokens = min(self.config.response_length, max_model_new_tokens)
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        max_tokens = max(1, int(max_tokens))
+        if sampling_params.pop("logprobs", False):
+            d0_7_top_logprobs = os.environ.get("VAGEN_D0_7_TOP_LOGPROBS")
+            sampling_params["logprobs"] = int(d0_7_top_logprobs) if d0_7_top_logprobs else 0
+        else:
+            sampling_params["logprobs"] = None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -417,6 +427,97 @@ class vLLMHttpServerBase:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+        d0_4_dir = os.environ.get("VAGEN_D0_4_DIR")
+        if d0_4_dir:
+            os.makedirs(d0_4_dir, exist_ok=True)
+            raw_records = []
+            if final_res.outputs[0].logprobs is not None:
+                for i, logprob_dict in enumerate(final_res.outputs[0].logprobs):
+                    tok = int(token_ids[i])
+                    item = logprob_dict.get(tok)
+                    raw_records.append(
+                        {
+                            "index": int(i),
+                            "token_id": tok,
+                            "logprob": None if item is None else float(item.logprob),
+                            "rank": None if item is None else getattr(item, "rank", None),
+                            "decoded_token": None if item is None else getattr(item, "decoded_token", None),
+                            "dict_size": len(logprob_dict),
+                            "contains_sampled_token": item is not None,
+                        }
+                    )
+            payload = {
+                "request_id": request_id,
+                "prompt_len": int(len(prompt_ids)),
+                "prompt_hash": hash(tuple(int(x) for x in prompt_ids)),
+                "max_tokens": max_tokens,
+                "sampling_params_input": original_sampling_params,
+                "sampling_params_effective": {
+                    "temperature": sampling_params.temperature,
+                    "top_p": sampling_params.top_p,
+                    "top_k": sampling_params.top_k,
+                    "min_p": sampling_params.min_p,
+                    "repetition_penalty": sampling_params.repetition_penalty,
+                    "logprobs": sampling_params.logprobs,
+                },
+                "token_ids": [int(x) for x in token_ids],
+                "log_probs": log_probs,
+                "raw_logprob_records": raw_records,
+            }
+            with open(os.path.join(d0_4_dir, "vllm_raw_logprobs.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        d0_7_dir = os.environ.get("VAGEN_D0_7_DIR")
+        if d0_7_dir:
+            os.makedirs(d0_7_dir, exist_ok=True)
+            records = []
+            if final_res.outputs[0].logprobs is not None:
+                for i, logprob_dict in enumerate(final_res.outputs[0].logprobs):
+                    tok = int(token_ids[i])
+                    item = logprob_dict.get(tok)
+                    top_items = []
+                    for token_id, logprob_obj in logprob_dict.items():
+                        top_items.append(
+                            {
+                                "token_id": int(token_id),
+                                "logprob": float(logprob_obj.logprob),
+                                "rank": getattr(logprob_obj, "rank", None),
+                                "decoded_token": getattr(logprob_obj, "decoded_token", None),
+                            }
+                        )
+                    top_items.sort(key=lambda x: (x["rank"] is None, x["rank"] if x["rank"] is not None else 10**9))
+                    records.append(
+                        {
+                            "index": int(i),
+                            "token_id": tok,
+                            "sampled_raw_logprob": None if item is None else float(item.logprob),
+                            "sampled_rank": None if item is None else getattr(item, "rank", None),
+                            "sampled_decoded_token": None if item is None else getattr(item, "decoded_token", None),
+                            "dict_size": len(logprob_dict),
+                            "top_logprobs": top_items,
+                            "stored_token_output_logprob": None if log_probs is None else float(log_probs[i]),
+                        }
+                    )
+            payload = {
+                "request_id": request_id,
+                "prompt_len": int(len(prompt_ids)),
+                "prompt_hash": hash(tuple(int(x) for x in prompt_ids)),
+                "max_tokens": max_tokens,
+                "sampling_params_input": original_sampling_params,
+                "sampling_params_effective": {
+                    "temperature": sampling_params.temperature,
+                    "top_p": sampling_params.top_p,
+                    "top_k": sampling_params.top_k,
+                    "min_p": sampling_params.min_p,
+                    "repetition_penalty": sampling_params.repetition_penalty,
+                    "logprobs": sampling_params.logprobs,
+                },
+                "semantics": "vLLM V1 model_config.logprobs_mode defaults to raw_logprobs; top_logprobs are raw log_softmax values before temperature/top-p sampling processors.",
+                "token_ids": [int(x) for x in token_ids],
+                "log_probs": log_probs,
+                "records": records,
+            }
+            with open(os.path.join(d0_7_dir, "production_vllm_top_logprobs.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
 
     async def wake_up(self):

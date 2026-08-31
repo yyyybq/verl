@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import os
+import threading
 from abc import ABC
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
@@ -33,6 +34,188 @@ from transformers.trainer_pt_utils import get_module_class_from_name
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.model import check_exclude_modules, check_target_modules
+
+
+_FSDP1_MIXED_GRAD_CLIP_LOCK = threading.Lock()
+
+
+def _get_grad_norm_allow_mixed_dtype(params, norm_type, zero, device):
+    """Equivalent to PyTorch FSDP's private helper without its dtype guard.
+
+    PyTorch already evaluates each per-gradient norm in FP32, so gradients of
+    different storage dtypes can be combined safely after converting each norm
+    to FP32. This preserves the public FSDP global sharded-norm semantics.
+    """
+    grads = [param.grad for param in params if param.grad is not None]
+    if not grads:
+        return zero
+    grad_norm = torch.linalg.vector_norm(
+        torch.stack(
+            [torch.linalg.vector_norm(grad.detach(), norm_type, dtype=torch.float32) for grad in grads]
+        ),
+        norm_type,
+        dtype=torch.float32,
+    )
+    return grad_norm.to(device=device)
+
+
+def fsdp1_clip_grad_norm_(module: FSDP, max_norm, norm_type=2.0):
+    """FSDP1 global grad clipping that supports mixed BF16/FP32 gradients.
+
+    Torch 2.7's public ``FSDP.clip_grad_norm_`` implements the correct global
+    reduction and dtype promotion, but its private local helper rejects mixed
+    gradient dtypes before doing the documented FP32 norm calculation. Patch
+    only that helper for the duration of the collective and retain all public
+    FSDP sharded/non-sharded accounting and in-place clipping behavior.
+    """
+    grad_dtypes = {param.grad.dtype for param in module.parameters() if param.grad is not None}
+    if len(grad_dtypes) <= 1:
+        return module.clip_grad_norm_(max_norm=max_norm, norm_type=norm_type)
+
+    import torch.distributed.fsdp.fully_sharded_data_parallel as fsdp_impl
+
+    with _FSDP1_MIXED_GRAD_CLIP_LOCK:
+        original_get_grad_norm = fsdp_impl._get_grad_norm
+        fsdp_impl._get_grad_norm = _get_grad_norm_allow_mixed_dtype
+        try:
+            return module.clip_grad_norm_(max_norm=max_norm, norm_type=norm_type)
+        finally:
+            fsdp_impl._get_grad_norm = original_get_grad_norm
+
+
+@torch.no_grad()
+def repair_unreduced_fsdp1_grad_shards_(module: FSDP):
+    """Reduce-scatter any FSDP1 flat gradient left unexpectedly unsharded.
+
+    A flat parameter managed by a sharded FSDP handle must present a local
+    gradient shard to both ``clip_grad_norm_`` and the optimizer. A missed
+    post-backward hook can instead leave the full low-precision gradient on a
+    local parameter shard. Detect that invariant violation by shape and run
+    the same padded reduce-scatter, predivide, postdivide, and parameter-dtype
+    cast used by PyTorch's FSDP1 post-backward path.
+
+    The repair is intentionally narrow: any shape that cannot be a padded full
+    gradient for an FSDP-managed sharded flat parameter raises immediately.
+    """
+    if not isinstance(module, FSDP):
+        return {"scanned": 0, "repaired": 0, "examples": []}
+
+    _lazy_init(module, module)
+    world_size = int(module.world_size)
+    process_group = module.process_group
+    predivide = float(module._gradient_predivide_factor)
+    postdivide = float(module._gradient_postdivide_factor)
+    repaired = []
+    scanned = 0
+
+    for handle_idx, handle in enumerate(module._all_handles):
+        flat_param = handle.flat_param
+        grad = flat_param.grad
+        if grad is None:
+            continue
+        scanned += 1
+        if grad.numel() == flat_param.numel():
+            continue
+        if not handle.uses_sharded_strategy:
+            raise RuntimeError(
+                "Non-sharded FSDP flat parameter has mismatched gradient shape: "
+                f"param={tuple(flat_param.shape)} grad={tuple(grad.shape)}"
+            )
+
+        local_numel = int(flat_param.numel())
+        full_numel = int(grad.numel())
+        padded_numel = local_numel * world_size
+        if full_numel <= local_numel or full_numel > padded_numel:
+            raise RuntimeError(
+                "Unsupported FSDP flat gradient shape mismatch: "
+                f"local_numel={local_numel} grad_numel={full_numel} world_size={world_size}"
+            )
+
+        original_grad_dtype = grad.dtype
+        full_grad = grad.detach().reshape(-1)
+        reduce_dtype = handle._reduce_dtype
+        if full_grad.dtype != reduce_dtype:
+            full_grad = full_grad.to(dtype=reduce_dtype)
+        if full_numel < padded_numel:
+            full_grad = torch.nn.functional.pad(full_grad, (0, padded_numel - full_numel))
+        if predivide > 1:
+            full_grad.div_(predivide)
+
+        local_grad = torch.empty(local_numel, dtype=full_grad.dtype, device=full_grad.device)
+        dist.reduce_scatter_tensor(local_grad, full_grad, group=process_group)
+        if postdivide > 1:
+            local_grad.div_(postdivide)
+        if local_grad.dtype != flat_param.dtype:
+            local_grad = local_grad.to(dtype=flat_param.dtype)
+
+        # The mismatched tensor was installed internally by FSDP, bypassing
+        # Parameter.grad's public shape guard. Replace its storage in place.
+        grad.data = local_grad.view_as(flat_param)
+        repaired.append(
+            {
+                "handle": handle_idx,
+                "local_numel": local_numel,
+                "full_grad_numel": full_numel,
+                "param_dtype": str(flat_param.dtype),
+                "original_grad_dtype": str(original_grad_dtype),
+                "reduce_dtype": str(reduce_dtype),
+                "fqns": list(getattr(flat_param, "_fqns", ()))[:4],
+            }
+        )
+
+    return {"scanned": scanned, "repaired": len(repaired), "examples": repaired[:8]}
+
+
+@torch.no_grad()
+def align_optimizer_grad_dtype_device_(optimizer):
+    """Align FSDP-produced gradients with their optimizer parameters.
+
+    FSDP may attach a low-precision gradient shard to a full-precision flat
+    parameter (or vice versa). PyTorch's foreach Adam implementation groups
+    parameters, gradients, and states by a common device/dtype and rejects
+    such a pair before performing any update. Preserve the already-clipped
+    gradient values while converting only mismatched gradient storage to the
+    parameter's optimizer dtype/device.
+
+    Returns a compact audit dictionary suitable for rank-local logging.
+    """
+    aligned = []
+    scanned = 0
+    for group_idx, param_group in enumerate(optimizer.param_groups):
+        for param_idx, param in enumerate(param_group["params"]):
+            grad = param.grad
+            if grad is None:
+                continue
+            scanned += 1
+            if grad.shape != param.shape:
+                raise RuntimeError(
+                    "Optimizer parameter/gradient shape mismatch remains after FSDP repair: "
+                    f"group={group_idx} index={param_idx} param={tuple(param.shape)} grad={tuple(grad.shape)}"
+                )
+            if grad.dtype == param.dtype and grad.device == param.device:
+                continue
+            aligned.append(
+                {
+                    "group": group_idx,
+                    "index": param_idx,
+                    "param_dtype": str(param.dtype),
+                    "grad_dtype": str(grad.dtype),
+                    "param_device": str(param.device),
+                    "grad_device": str(grad.device),
+                    "numel": int(grad.numel()),
+                }
+            )
+            # FSDP installs the mismatched shard internally, bypassing the
+            # Parameter.grad assignment guard. Mutating the grad tensor's data
+            # is therefore required before a type-correct reassignment would
+            # be possible.
+            grad.data = grad.data.to(device=param.device, dtype=param.dtype)
+
+    return {
+        "scanned": scanned,
+        "aligned": len(aligned),
+        "examples": aligned[:8],
+    }
 
 if version.parse(torch.__version__) >= version.parse("2.6"):
     from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, fully_shard

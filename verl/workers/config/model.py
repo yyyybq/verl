@@ -119,6 +119,12 @@ class HFModelConfig(BaseConfig):
 
         # constuct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
+        # Fall back to eager if flash_attn is unavailable (e.g. GLIBC mismatch)
+        try:
+            import flash_attn  # noqa: F401
+        except (ImportError, OSError):
+            if attn_implementation == "flash_attention_2":
+                attn_implementation = "eager"
         self.hf_config = AutoConfig.from_pretrained(
             self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation
         )

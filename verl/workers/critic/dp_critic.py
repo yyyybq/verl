@@ -193,6 +193,9 @@ class DataParallelPPOCritic(BasePPOCritic):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
+        valid_pred_chunks = []
+        valid_target_chunks = []
+        sentinel_pred_chunks = []
 
         select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -221,13 +224,18 @@ class DataParallelPPOCritic(BasePPOCritic):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    raw_response_mask = model_inputs["response_mask"]
+                    response_mask = raw_response_mask
                     values = model_inputs["values"]
                     returns = model_inputs["returns"]
-                    value_mask=model_inputs.get("value_mask", response_mask)
-                    response_mask = response_mask * value_mask
+                    value_mask = model_inputs.get("value_mask", response_mask)
+                    sentinel_mask_from_returns = (returns.detach().float() + 100.0).abs() < 1e-2
+                    valid_mask = raw_response_mask.bool() & value_mask.bool() & ~sentinel_mask_from_returns
+                    response_mask = valid_mask.to(dtype=raw_response_mask.dtype)
 
                     vpreds = self._forward_micro_batch(model_inputs)
+                    if not valid_mask.any():
+                        raise RuntimeError("critic update received no valid value targets")
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                         vpreds=vpreds,
                         values=values,
@@ -246,6 +254,13 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     loss.backward()
 
+                    valid_vpreds = vpreds[valid_mask].detach().float()
+                    valid_returns = returns[valid_mask].detach().float()
+                    sentinel_mask = raw_response_mask.bool() & sentinel_mask_from_returns
+                    valid_pred_chunks.append(valid_vpreds.cpu())
+                    valid_target_chunks.append(valid_returns.cpu())
+                    if sentinel_mask.any():
+                        sentinel_pred_chunks.append(vpreds[sentinel_mask].detach().float().cpu())
                     micro_batch_metrics.update(
                         {
                             "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
@@ -259,5 +274,28 @@ class DataParallelPPOCritic(BasePPOCritic):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"critic/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+        if valid_pred_chunks:
+            all_valid_preds = torch.cat(valid_pred_chunks).float()
+            all_valid_targets = torch.cat(valid_target_chunks).float()
+            valid_error = all_valid_preds - all_valid_targets
+            target_var = torch.var(all_valid_targets, unbiased=False)
+            error_var = torch.var(valid_error, unbiased=False)
+            explained_var = 1.0 - error_var / (target_var + 1e-5)
+            aggregate_metrics = {
+                "critic/valid_count": int(all_valid_targets.numel()),
+                "critic/pred_valid_mean": all_valid_preds.mean().item(),
+                "critic/pred_valid_min": all_valid_preds.min().item(),
+                "critic/pred_valid_max": all_valid_preds.max().item(),
+                "critic/target_valid_mean": all_valid_targets.mean().item(),
+                "critic/target_valid_min": all_valid_targets.min().item(),
+                "critic/target_valid_max": all_valid_targets.max().item(),
+                "critic/mae_valid": valid_error.abs().mean().item(),
+                "critic/rmse_valid": torch.sqrt(valid_error.square().mean()).item(),
+                "critic/explained_var_valid": explained_var.item(),
+                "critic/sentinel_pred_mean": (
+                    torch.cat(sentinel_pred_chunks).float().mean().item() if sentinel_pred_chunks else 0.0
+                ),
+            }
+            append_to_dict(metrics, aggregate_metrics)
         self.critic_optimizer.zero_grad()
         return metrics

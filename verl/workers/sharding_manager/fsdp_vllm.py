@@ -13,11 +13,15 @@
 # limitations under the License.
 
 import inspect
+import hashlib
+import json
 import logging
 import os
 import time
 from collections import OrderedDict
+from typing import Mapping
 
+import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -51,6 +55,230 @@ from .base import BaseShardingManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _d0_6_tensor(tensor):
+    if isinstance(tensor, DTensor):
+        tensor = tensor.full_tensor()
+    return tensor.detach()
+
+
+def _d0_6_checksum(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().float().contiguous().cpu()
+    return hashlib.sha256(cpu.numpy().tobytes()).hexdigest()
+
+
+def _d0_6_sample_values(tensor: torch.Tensor) -> list[float]:
+    flat = tensor.detach().flatten()
+    if flat.numel() == 0:
+        return []
+    idxs = sorted(set([0, flat.numel() // 2, flat.numel() - 1]))
+    return [float(flat[i].detach().float().cpu().item()) for i in idxs]
+
+
+def _d0_6_pair_stats(source: torch.Tensor, target: torch.Tensor) -> dict:
+    src = _d0_6_tensor(source)
+    tgt = _d0_6_tensor(target)
+    base = {
+        "source_shape": list(src.shape),
+        "target_shape": list(tgt.shape),
+        "source_dtype": str(src.dtype),
+        "target_dtype": str(tgt.dtype),
+        "source_checksum": _d0_6_checksum(src),
+        "target_checksum": _d0_6_checksum(tgt),
+        "source_sample_values": _d0_6_sample_values(src),
+        "target_sample_values": _d0_6_sample_values(tgt),
+    }
+    if tuple(src.shape) != tuple(tgt.shape):
+        base.update(
+            {
+                "shape_mismatch": True,
+                "max_abs_diff": None,
+                "mean_abs_diff": None,
+                "l2": None,
+                "cosine": None,
+            }
+        )
+        return base
+    src_f = src.detach().float().cpu()
+    tgt_f = tgt.detach().float().cpu()
+    diff = (src_f - tgt_f).abs()
+    src_cast = src.detach().to(dtype=tgt.dtype).cpu()
+    tgt_cast_ref = tgt.detach().cpu()
+    cast_diff = (src_cast.float() - tgt_cast_ref.float()).abs()
+    src_flat = src_f.flatten()
+    tgt_flat = tgt_f.flatten()
+    denom = torch.linalg.vector_norm(src_flat) * torch.linalg.vector_norm(tgt_flat)
+    cosine = None if float(denom.detach().cpu().item()) == 0.0 else float(torch.dot(src_flat, tgt_flat).div(denom).detach().cpu().item())
+    base.update({
+        "shape_mismatch": False,
+        "strict_exact_equal": str(src.dtype) == str(tgt.dtype) and torch.equal(src.cpu(), tgt.cpu()),
+        "max_abs_diff": float(diff.max().detach().cpu().item()) if diff.numel() else 0.0,
+        "mean_abs_diff": float(diff.mean().detach().cpu().item()) if diff.numel() else 0.0,
+        "l2": float(torch.linalg.vector_norm(diff.flatten()).detach().cpu().item()) if diff.numel() else 0.0,
+        "cosine": cosine,
+        "source_cast_to_target_dtype": str(tgt.dtype),
+        "source_cast_to_target_checksum": _d0_6_checksum(src_cast),
+        "source_cast_to_target_sample_values": _d0_6_sample_values(src_cast),
+        "source_cast_equals_target": torch.equal(src_cast, tgt_cast_ref),
+        "max_abs_diff_after_source_cast": float(cast_diff.max().detach().cpu().item()) if cast_diff.numel() else 0.0,
+        "mean_abs_diff_after_source_cast": float(cast_diff.mean().detach().cpu().item()) if cast_diff.numel() else 0.0,
+    })
+    return base
+
+
+def _d0_6_slice_rows(tensor: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:
+    n = tensor.shape[0]
+    per = n // tp_size
+    return tensor[tp_rank * per:(tp_rank + 1) * per]
+
+
+def _d0_6_slice_cols(tensor: torch.Tensor, tp_rank: int, tp_size: int) -> torch.Tensor:
+    n = tensor.shape[1]
+    per = n // tp_size
+    return tensor[:, tp_rank * per:(tp_rank + 1) * per]
+
+
+def _d0_6_slice_rows_unless_already_sharded(tensor: torch.Tensor, target: torch.Tensor | None, tp_rank: int, tp_size: int) -> torch.Tensor:
+    if target is not None and tuple(tensor.shape) == tuple(target.shape):
+        return tensor
+    return _d0_6_slice_rows(tensor, tp_rank, tp_size)
+
+
+def _d0_6_qkv_expected(updated_params: Mapping[str, torch.Tensor], layer: int, tp_rank: int, tp_size: int, suffix: str) -> torch.Tensor:
+    q = _d0_6_tensor(updated_params[f"model.layers.{layer}.self_attn.q_proj.{suffix}"])
+    k = _d0_6_tensor(updated_params[f"model.layers.{layer}.self_attn.k_proj.{suffix}"])
+    v = _d0_6_tensor(updated_params[f"model.layers.{layer}.self_attn.v_proj.{suffix}"])
+    return torch.cat([
+        _d0_6_slice_rows(q, tp_rank, tp_size),
+        _d0_6_slice_rows(k, tp_rank, tp_size),
+        _d0_6_slice_rows(v, tp_rank, tp_size),
+    ], dim=0)
+
+
+def _d0_6_gate_up_expected(updated_params: Mapping[str, torch.Tensor], layer: int, tp_rank: int, tp_size: int) -> torch.Tensor:
+    gate = _d0_6_tensor(updated_params[f"model.layers.{layer}.mlp.gate_proj.weight"])
+    up = _d0_6_tensor(updated_params[f"model.layers.{layer}.mlp.up_proj.weight"])
+    return torch.cat([
+        _d0_6_slice_rows(gate, tp_rank, tp_size),
+        _d0_6_slice_rows(up, tp_rank, tp_size),
+    ], dim=0)
+
+
+def d0_6_required_source_weight_names() -> set[str]:
+    names = {
+        "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.13.self_attn.q_proj.weight",
+        "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.25.self_attn.q_proj.weight",
+        "model.vision_tower_aux_list.0.vision_tower.vision_model.post_layernorm.weight",
+        "model.mm_projector.0.weight",
+        "model.mm_projector.0.bias",
+        "model.mm_projector.2.weight",
+        "model.mm_projector.2.bias",
+        "model.image_newline",
+        "model.norm.weight",
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+    }
+    for layer in (0, 14, 27):
+        names.update(
+            {
+                f"model.layers.{layer}.self_attn.q_proj.weight",
+                f"model.layers.{layer}.self_attn.k_proj.weight",
+                f"model.layers.{layer}.self_attn.v_proj.weight",
+                f"model.layers.{layer}.self_attn.q_proj.bias",
+                f"model.layers.{layer}.self_attn.k_proj.bias",
+                f"model.layers.{layer}.self_attn.v_proj.bias",
+                f"model.layers.{layer}.self_attn.o_proj.weight",
+                f"model.layers.{layer}.mlp.gate_proj.weight",
+                f"model.layers.{layer}.mlp.up_proj.weight",
+                f"model.layers.{layer}.mlp.down_proj.weight",
+            }
+        )
+    return names
+
+
+def _d0_6_compare_weight_sync(model, updated_params, *, out_dir: str, tp_rank: int, tp_size: int) -> dict:
+    params = dict(model.named_parameters())
+    records = {}
+    missing = []
+
+    def add(name: str, source, target_name: str):
+        target = params.get(target_name)
+        if source is None or target is None:
+            missing.append({"name": name, "target_name": target_name, "source_missing": source is None, "target_missing": target is None})
+            return
+        records[name] = {"target_name": target_name, **_d0_6_pair_stats(source, target)}
+
+    # Full replicated Cambrian multimodal tensors.
+    direct = {
+        "vision_layer0_q": (
+            "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+            "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        ),
+        "vision_layer13_q": (
+            "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.13.self_attn.q_proj.weight",
+            "vision_tower.vision_model.encoder.layers.13.self_attn.q_proj.weight",
+        ),
+        "vision_layer25_q": (
+            "model.vision_tower_aux_list.0.vision_tower.vision_model.encoder.layers.25.self_attn.q_proj.weight",
+            "vision_tower.vision_model.encoder.layers.25.self_attn.q_proj.weight",
+        ),
+        "vision_post_layernorm": (
+            "model.vision_tower_aux_list.0.vision_tower.vision_model.post_layernorm.weight",
+            "vision_tower.vision_model.post_layernorm.weight",
+        ),
+        "mm_projector_0_weight": ("model.mm_projector.0.weight", "mm_projector.0.weight"),
+        "mm_projector_0_bias": ("model.mm_projector.0.bias", "mm_projector.0.bias"),
+        "mm_projector_2_weight": ("model.mm_projector.2.weight", "mm_projector.2.weight"),
+        "mm_projector_2_bias": ("model.mm_projector.2.bias", "mm_projector.2.bias"),
+        "image_newline": ("model.image_newline", "image_newline"),
+        "llm_final_norm": ("model.norm.weight", "language_model.model.norm.weight"),
+    }
+    for label, (src_name, tgt_name) in direct.items():
+        add(label, updated_params.get(src_name), tgt_name)
+
+    # Tensor-parallel LLM tensors.
+    embed_src = updated_params.get("model.embed_tokens.weight")
+    lm_head_src = updated_params.get("lm_head.weight")
+    embed_tgt = params.get("language_model.model.embed_tokens.weight")
+    lm_head_tgt = params.get("language_model.lm_head.weight")
+    add("embed_tokens_shard", None if embed_src is None else _d0_6_slice_rows_unless_already_sharded(_d0_6_tensor(embed_src), embed_tgt, tp_rank, tp_size), "language_model.model.embed_tokens.weight")
+    add("lm_head_shard", None if lm_head_src is None else _d0_6_slice_rows_unless_already_sharded(_d0_6_tensor(lm_head_src), lm_head_tgt, tp_rank, tp_size), "language_model.lm_head.weight")
+
+    for layer in (0, 14, 27):
+        pfx = f"language_model.model.layers.{layer}"
+        try:
+            add(f"layer{layer}_qkv_weight_shard", _d0_6_qkv_expected(updated_params, layer, tp_rank, tp_size, "weight"), f"{pfx}.self_attn.qkv_proj.weight")
+            add(f"layer{layer}_qkv_bias_shard", _d0_6_qkv_expected(updated_params, layer, tp_rank, tp_size, "bias"), f"{pfx}.self_attn.qkv_proj.bias")
+            add(f"layer{layer}_o_weight_col_shard", _d0_6_slice_cols(_d0_6_tensor(updated_params[f"model.layers.{layer}.self_attn.o_proj.weight"]), tp_rank, tp_size), f"{pfx}.self_attn.o_proj.weight")
+            add(f"layer{layer}_gate_up_weight_shard", _d0_6_gate_up_expected(updated_params, layer, tp_rank, tp_size), f"{pfx}.mlp.gate_up_proj.weight")
+            add(f"layer{layer}_down_weight_col_shard", _d0_6_slice_cols(_d0_6_tensor(updated_params[f"model.layers.{layer}.mlp.down_proj.weight"]), tp_rank, tp_size), f"{pfx}.mlp.down_proj.weight")
+        except Exception as exc:
+            missing.append({"name": f"layer{layer}_packed_exception", "error": repr(exc)})
+
+    strict_all_equal = all((not r.get("shape_mismatch")) and r.get("strict_exact_equal") for r in records.values()) and not missing
+    cast_all_equal = all((not r.get("shape_mismatch")) and r.get("source_cast_equals_target") for r in records.values()) and not missing
+    payload = {
+        "tag": "d0_6_weight_equality_after_fsdp_to_vllm_sync",
+        "rank": int(os.environ.get("RANK", "-1")),
+        "local_rank": int(os.environ.get("LOCAL_RANK", "-1")),
+        "tp_rank": int(tp_rank),
+        "tp_size": int(tp_size),
+        "compared_tensor_count": len(records),
+        "missing": missing,
+        "strict_all_compared_equal": strict_all_equal,
+        "all_compared_equal": cast_all_equal,
+        "all_compared_equal_after_source_cast_to_target_dtype": cast_all_equal,
+        "tensors": records,
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"d0_6_weight_equality_rank{payload['rank']}_tp{tp_rank}_pid{os.getpid()}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    if os.environ.get("VAGEN_D0_6_ABORT_ON_WEIGHT_MISMATCH") == "1" and not cast_all_equal:
+        raise RuntimeError(f"D0.6 weight equality failed; wrote {path}")
+    return payload
 
 
 @deprecated()
@@ -224,6 +452,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
             # update model params
             self.update_params(params, peft_config=peft_config)
+            d0_6_dir = os.environ.get("VAGEN_D0_6_DIR")
+            if d0_6_dir and peft_config is None:
+                _d0_6_compare_weight_sync(
+                    self.model_runner.model,
+                    params,
+                    out_dir=d0_6_dir,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                )
             log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
             del params
             get_torch_device().empty_cache()

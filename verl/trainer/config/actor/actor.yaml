@@ -74,6 +74,11 @@ loss_agg_mode: token-mean
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Coefficient for optional next-frame prediction auxiliary loss
+nfp_loss_coef: 1.0
+# Optional SenseNova-U1 FM image-gen aux coef; overrides nfp_loss_coef when set
+image_gen_loss_coef: null
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
