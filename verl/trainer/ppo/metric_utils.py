@@ -436,15 +436,22 @@ def process_validation_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                if isinstance(var_vals[0], str):
+                # Some environments do not emit every optional reward extra for
+                # every validation sample.  Exclude missing values before doing
+                # numeric reductions, while keeping `pred` aligned for voting.
+                valid_indices = [idx for idx, value in enumerate(var_vals) if value is not None]
+                if not valid_indices:
+                    continue
+                clean_var_vals = [var_vals[idx] for idx in valid_indices]
+                if isinstance(clean_var_vals[0], str):
                     continue
 
                 metric = {}
-                n_resps = len(var_vals)
-                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                n_resps = len(clean_var_vals)
+                metric[f"mean@{n_resps}"] = np.mean(clean_var_vals)
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    metric[f"std@{n_resps}"] = np.std(clean_var_vals)
 
                     ns = []
                     n = 2
@@ -455,13 +462,15 @@ def process_validation_metrics(
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                            data=clean_var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
                         if var2vals.get("pred", None) is not None:
+                            clean_preds = [var2vals["pred"][idx] for idx in valid_indices]
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(clean_var_vals, clean_preds, strict=True)
                             ]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
                                 data=vote_data,
