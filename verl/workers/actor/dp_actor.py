@@ -366,6 +366,8 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
             if return_aux_loss:
+                # the model line's NFP loss (2026-11-03): its statistics for the metrics (vagen/models/cambrian_nfp.py)
+                self._last_nfp_stats = getattr(output, "nfp_stats", None)
                 return entropy, log_probs, self._extract_auxiliary_loss(output)
             return entropy, log_probs
 
@@ -693,13 +695,12 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         aux_loss = aux_loss.to(policy_loss.device)
                         policy_loss = policy_loss + aux_loss * nfp_loss_coef
-                        micro_batch_metrics["actor/nfp_loss"] = aux_loss.detach().item()
-                        micro_batch_metrics["actor/nfp_loss_scaled"] = (
-                            aux_loss.detach().item() * nfp_loss_coef * loss_scale_factor
-                        )
-                        micro_batch_metrics["actor/nfp_loss_coef"] = nfp_loss_coef
-                        micro_batch_metrics["actor/image_gen_loss_coef"] = nfp_loss_coef
-                        micro_batch_metrics["actor/nfp_loss_active"] = 1.0
+                        # with the model line's statistics (an episode without a pair is not counted); else as before
+                        from vagen.models.cambrian_nfp import nfp_metrics
+
+                        micro_batch_metrics.update(nfp_metrics(aux_loss.detach().item(),
+                                                               getattr(self, "_last_nfp_stats", None),
+                                                               nfp_loss_coef, loss_scale_factor))
                     else:
                         micro_batch_metrics["actor/nfp_loss_active"] = 0.0
 
