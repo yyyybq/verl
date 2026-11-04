@@ -366,8 +366,11 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
             if return_aux_loss:
-                # the model line's NFP loss (2026-11-03): its statistics for the metrics (vagen/models/cambrian_nfp.py)
-                self._last_nfp_stats = getattr(output, "nfp_stats", None)
+                # the model line's NFP loss (2026-11-03): its statistics for the metrics (vagen/models/cambrian_nfp.py);
+                # FSDP rebuilds the output and drops that attribute, so they come from the adapter's kept copy (11-04)
+                from vagen.models.cambrian_nfp import take_stats
+
+                self._last_nfp_stats = take_stats(output)
                 return entropy, log_probs, self._extract_auxiliary_loss(output)
             return entropy, log_probs
 
