@@ -83,6 +83,9 @@ class ActorConfig(BaseConfig):
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
+        und_mix (dict|None): VAGEN-Lite's understanding batches (vagen/und_mix.py, the reward line, 2026-11-05):
+            with "enable" true, every "interval"-th optimizer step adds "weight" x the next-token loss of
+            "batch_size" understanding samples to the policy loss.  None (the default): nothing changes.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -124,6 +127,7 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    und_mix: Optional[dict] = None
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

@@ -159,6 +159,15 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        # VAGEN-Lite, the reward line (2026-11-05): understanding batches mixed into the policy update
+        # (vagen/und_mix.py); none unless the config's und_mix says enable
+        self._und_mixer = None
+        und_mix = self.config.get("und_mix") or {}
+        if actor_optimizer is not None and und_mix.get("enable"):
+            from vagen.und_mix import UndMixer
+
+            self._und_mixer = UndMixer(dict(und_mix), self)
+
     @staticmethod
     def _extract_auxiliary_loss(output) -> torch.Tensor | None:
         """Return a scalar auxiliary loss from model outputs, if one is present."""
@@ -781,11 +790,15 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/entropy_loss"] = float(entropy_loss.detach().item())
                     append_to_dict(metrics, micro_batch_metrics)
 
+                if self._und_mixer is not None:  # the understanding batch of this optimizer step, before clipping
+                    append_to_dict(metrics, self._und_mixer.before_optimizer_step())
                 grad_norm = self._optimizer_step()
                 _d0_13_marker("before_metrics_reduce", batch_idx=int(batch_idx))
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
                 _d0_13_marker("after_metrics_reduce", metric_keys=len(metrics))
         self.actor_optimizer.zero_grad()
+        if self._und_mixer is not None:
+            append_to_dict(metrics, self._und_mixer.end_of_update())
         _d0_13_marker("before_worker_return", metric_keys=len(metrics))
         return metrics
