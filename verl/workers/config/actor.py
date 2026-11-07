@@ -86,6 +86,9 @@ class ActorConfig(BaseConfig):
         und_mix (dict|None): VAGEN-Lite's understanding batches (vagen/und_mix.py, the reward line, 2026-11-05):
             with "enable" true, every "interval"-th optimizer step adds "weight" x the next-token loss of
             "batch_size" understanding samples to the policy loss.  None (the default): nothing changes.
+        dagger (dict|None): VAGEN-Lite's distance-table action labels (vagen/dagger.py, the reward line, phase 3,
+            2026-11-07): with "enable" true, the update's one optimizer step adds "lam" x the next-token loss of the
+            label samples the trainer attached to the batch.  None (the default): nothing changes.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -128,6 +131,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     und_mix: Optional[dict] = None
+    dagger: Optional[dict] = None
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

@@ -167,6 +167,16 @@ class DataParallelPPOActor(BasePPOActor):
             from vagen.und_mix import UndMixer
 
             self._und_mixer = UndMixer(dict(und_mix), self)
+        # VAGEN-Lite, the reward line (phase 3, 2026-11-07): the distance table's action labels in the policy update
+        # (vagen/dagger.py); none unless the config's dagger says enable
+        self._dagger = None
+        dagger = self.config.get("dagger") or {}
+        if actor_optimizer is not None and dagger.get("enable"):
+            if self._und_mixer is not None:
+                raise ValueError("actor.dagger and actor.und_mix together are not supported")
+            from vagen.dagger import DaggerMixer
+
+            self._dagger = DaggerMixer(dict(dagger), self)
 
     @staticmethod
     def _extract_auxiliary_loss(output) -> torch.Tensor | None:
@@ -561,6 +571,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        if self._dagger is not None:  # VAGEN-Lite: the label samples ride on the batch; taken before the select
+            self._dagger.take_batch(data)
 
         select_keys = [
             "responses",
@@ -792,6 +804,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if self._und_mixer is not None:  # the understanding batch of this optimizer step, before clipping
                     append_to_dict(metrics, self._und_mixer.before_optimizer_step())
+                if self._dagger is not None:  # the label samples, in the update's first optimizer step
+                    append_to_dict(metrics, self._dagger.before_optimizer_step())
                 grad_norm = self._optimizer_step()
                 _d0_13_marker("before_metrics_reduce", batch_idx=int(batch_idx))
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
@@ -800,5 +814,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         if self._und_mixer is not None:
             append_to_dict(metrics, self._und_mixer.end_of_update())
+        if self._dagger is not None:
+            append_to_dict(metrics, self._dagger.end_of_update())
         _d0_13_marker("before_worker_return", metric_keys=len(metrics))
         return metrics
